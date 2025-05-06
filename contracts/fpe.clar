@@ -135,3 +135,126 @@
 (define-read-only (get-dispute (contract-id uint))
   (ok (unwrap! (map-get? ContractDisputes contract-id) ERR-NOT-FOUND))
 )
+
+
+(define-map ContractMilestones
+  { contract-id: uint, milestone-id: uint }
+  {
+    amount: uint,
+    description: (string-ascii 256),
+    status: uint
+  }
+)
+
+(define-map ContractMilestoneCount
+  uint 
+  uint
+)
+
+(define-public (add-milestone (contract-id uint) (amount uint) (description (string-ascii 256)))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (milestone-count (default-to u0 (map-get? ContractMilestoneCount contract-id)))
+    )
+    (asserts! (is-eq (get employer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status contract) STATUS-PENDING) ERR-WRONG-STATUS)
+    (map-set ContractMilestones 
+      { contract-id: contract-id, milestone-id: milestone-count }
+      {
+        amount: amount,
+        description: description,
+        status: STATUS-PENDING
+      }
+    )
+    (map-set ContractMilestoneCount contract-id (+ milestone-count u1))
+    (ok milestone-count)
+  )
+)
+
+(define-public (complete-milestone (contract-id uint) (milestone-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (milestone (unwrap! (map-get? ContractMilestones { contract-id: contract-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq (get freelancer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status milestone) STATUS-IN-PROGRESS) ERR-WRONG-STATUS)
+    (try! (as-contract (stx-transfer? (get amount milestone) tx-sender (get freelancer contract))))
+    (map-set ContractMilestones
+      { contract-id: contract-id, milestone-id: milestone-id }
+      (merge milestone {status: STATUS-COMPLETED})
+    )
+    (ok true)
+  )
+)
+
+
+
+(define-public (release-milestone-payment (contract-id uint) (milestone-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (milestone (unwrap! (map-get? ContractMilestones { contract-id: contract-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq (get employer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status milestone) STATUS-COMPLETED) ERR-WRONG-STATUS)
+    (try! (as-contract (stx-transfer? (get amount milestone) tx-sender (get freelancer contract))))
+    (map-set ContractMilestones
+      { contract-id: contract-id, milestone-id: milestone-id }
+      (merge milestone {status: STATUS-RESOLVED})
+    )
+    (ok true)
+  )
+)
+(define-public (get-milestone (contract-id uint) (milestone-id uint))
+  (ok (unwrap! (map-get? ContractMilestones { contract-id: contract-id, milestone-id: milestone-id }) ERR-NOT-FOUND))
+)
+(define-public (get-milestone-count (contract-id uint))
+  (ok (default-to u0 (map-get? ContractMilestoneCount contract-id)))
+)
+
+(define-map UserRatings
+  principal
+  {
+    total-ratings: uint,
+    total-score: uint,
+    as-employer: uint,
+    as-freelancer: uint
+  }
+)
+
+(define-map ContractRatings
+  uint
+  {
+    employer-rating: (optional uint),
+    freelancer-rating: (optional uint),
+    employer-review: (optional (string-ascii 256)),
+    freelancer-review: (optional (string-ascii 256))
+  }
+)
+
+(define-public (rate-contract-party (contract-id uint) (rating uint) (review (string-ascii 256)))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (existing-ratings (unwrap! (map-get? ContractRatings contract-id) ERR-NOT-FOUND))
+      (target-principal (if (is-eq tx-sender (get employer contract)) 
+        (get freelancer contract)
+        (get employer contract)))
+      (user-stats (default-to 
+        { total-ratings: u0, total-score: u0, as-employer: u0, as-freelancer: u0 }
+        (map-get? UserRatings target-principal)))
+    )
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-AMOUNT)
+    (asserts! (is-eq (get status contract) STATUS-RESOLVED) ERR-WRONG-STATUS)
+    (asserts! (or (is-eq tx-sender (get employer contract)) (is-eq tx-sender (get freelancer contract))) ERR-NOT-AUTHORIZED)
+    (map-set UserRatings target-principal
+      (merge user-stats {
+        total-ratings: (+ (get total-ratings user-stats) u1),
+        total-score: (+ (get total-score user-stats) rating)
+      })
+    )
+    (ok true)
+  )
+)
