@@ -258,3 +258,138 @@
     (ok true)
   )
 )
+
+(define-constant ERR-DEADLINE-NOT-REACHED (err u106))
+(define-constant ERR-DEADLINE-EXPIRED (err u107))
+
+(define-constant DEFAULT-REVIEW-PERIOD u144)
+
+(define-map ContractDeadlines
+  uint
+  {
+    completion-block: uint,
+    review-period: uint,
+    auto-release-enabled: bool
+  }
+)
+
+(define-public (create-contract-with-deadline (freelancer principal) (amount uint) (review-period uint))
+  (let
+    (
+      (contract-id (var-get contract-nonce))
+    )
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (> review-period u0) ERR-INVALID-AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-insert Contracts contract-id {
+      employer: tx-sender,
+      freelancer: freelancer,
+      amount: amount,
+      status: STATUS-PENDING,
+      created-at: stacks-block-height
+    })
+    (map-insert ContractDeadlines contract-id {
+      completion-block: u0,
+      review-period: review-period,
+      auto-release-enabled: true
+    })
+    (var-set contract-nonce (+ contract-id u1))
+    (ok contract-id)
+  )
+)
+
+(define-public (complete-work-with-deadline (contract-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (deadline-info (unwrap! (map-get? ContractDeadlines contract-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq (get freelancer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status contract) STATUS-IN-PROGRESS) ERR-WRONG-STATUS)
+    (map-set Contracts contract-id (merge contract {status: STATUS-COMPLETED}))
+    (map-set ContractDeadlines contract-id 
+      (merge deadline-info {completion-block: stacks-block-height}))
+    (ok true)
+  )
+)
+
+(define-public (auto-release-payment (contract-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (deadline-info (unwrap! (map-get? ContractDeadlines contract-id) ERR-NOT-FOUND))
+      (deadline-block (+ (get completion-block deadline-info) (get review-period deadline-info)))
+    )
+    (asserts! (is-eq (get freelancer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status contract) STATUS-COMPLETED) ERR-WRONG-STATUS)
+    (asserts! (get auto-release-enabled deadline-info) ERR-NOT-AUTHORIZED)
+    (asserts! (> (get completion-block deadline-info) u0) ERR-WRONG-STATUS)
+    (asserts! (>= stacks-block-height deadline-block) ERR-DEADLINE-NOT-REACHED)
+    (try! (as-contract (stx-transfer? (get amount contract) tx-sender (get freelancer contract))))
+    (map-set Contracts contract-id (merge contract {status: STATUS-RESOLVED}))
+    (ok true)
+  )
+)
+
+(define-public (release-payment-before-deadline (contract-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (deadline-info (unwrap! (map-get? ContractDeadlines contract-id) ERR-NOT-FOUND))
+      (deadline-block (+ (get completion-block deadline-info) (get review-period deadline-info)))
+    )
+    (asserts! (is-eq (get employer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status contract) STATUS-COMPLETED) ERR-WRONG-STATUS)
+    (asserts! (< stacks-block-height deadline-block) ERR-DEADLINE-EXPIRED)
+    (try! (as-contract (stx-transfer? (get amount contract) tx-sender (get freelancer contract))))
+    (map-set Contracts contract-id (merge contract {status: STATUS-RESOLVED}))
+    (ok true)
+  )
+)
+
+(define-public (toggle-auto-release (contract-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (deadline-info (unwrap! (map-get? ContractDeadlines contract-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq (get employer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq (get status contract) STATUS-RESOLVED)) ERR-WRONG-STATUS)
+    (map-set ContractDeadlines contract-id 
+      (merge deadline-info {auto-release-enabled: (not (get auto-release-enabled deadline-info))}))
+    (ok (not (get auto-release-enabled deadline-info)))
+  )
+)
+
+(define-read-only (get-contract-deadline (contract-id uint))
+  (ok (unwrap! (map-get? ContractDeadlines contract-id) ERR-NOT-FOUND))
+)
+
+(define-read-only (get-time-until-auto-release (contract-id uint))
+  (let
+    (
+      (deadline-info (unwrap! (map-get? ContractDeadlines contract-id) ERR-NOT-FOUND))
+      (deadline-block (+ (get completion-block deadline-info) (get review-period deadline-info)))
+    )
+    (if (> (get completion-block deadline-info) u0)
+      (if (>= stacks-block-height deadline-block)
+        (ok u0)
+        (ok (- deadline-block stacks-block-height)))
+      (ok (get review-period deadline-info)))
+  )
+)
+
+(define-read-only (can-auto-release (contract-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (deadline-info (unwrap! (map-get? ContractDeadlines contract-id) ERR-NOT-FOUND))
+      (deadline-block (+ (get completion-block deadline-info) (get review-period deadline-info)))
+    )
+    (ok (and 
+      (is-eq (get status contract) STATUS-COMPLETED)
+      (get auto-release-enabled deadline-info)
+      (> (get completion-block deadline-info) u0)
+      (>= stacks-block-height deadline-block)))
+  )
+)
