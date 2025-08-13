@@ -9,6 +9,8 @@
 (define-constant ERR-WITHDRAWAL-PROTECTED (err u108))
 (define-constant ERR-PROTECTION-ACTIVE (err u109))
 (define-constant ERR-PROTECTION-PERIOD-NOT-ELAPSED (err u110))
+(define-constant ERR-INSUFFICIENT-REPUTATION (err u111))
+(define-constant ERR-PERFORMANCE-NOT-FOUND (err u112))
 
 (define-constant STATUS-PENDING u1)
 (define-constant STATUS-IN-PROGRESS u2)
@@ -19,6 +21,24 @@
 (define-constant DEFAULT-PROTECTION-PERIOD u144)
 (define-constant MIN-PROTECTION-PERIOD u72)
 (define-constant MAX-PROTECTION-PERIOD u1008)
+
+;; Performance tier constants
+(define-constant TIER-BRONZE u1)
+(define-constant TIER-SILVER u2)
+(define-constant TIER-GOLD u3)
+(define-constant TIER-PLATINUM u4)
+
+;; Performance scoring weights (out of 100)
+(define-constant WEIGHT-COMPLETION-RATE u30)
+(define-constant WEIGHT-DISPUTE-RATE u25)
+(define-constant WEIGHT-RESPONSE-TIME u20)
+(define-constant WEIGHT-QUALITY-SCORE u25)
+
+;; Fee discount percentages by tier
+(define-constant BRONZE-DISCOUNT u0)
+(define-constant SILVER-DISCOUNT u5)
+(define-constant GOLD-DISCOUNT u10)
+(define-constant PLATINUM-DISCOUNT u15)
 
 (define-data-var contract-nonce uint u0)
 (define-data-var mediator principal tx-sender)
@@ -66,6 +86,43 @@
 (define-map UserWithdrawalCount
   principal
   uint
+)
+
+;; Performance tracking maps
+(define-map UserPerformanceMetrics
+  principal
+  {
+    total-contracts: uint,
+    completed-contracts: uint,
+    disputed-contracts: uint,
+    avg-completion-time: uint,
+    total-quality-score: uint,
+    response-time-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-map UserReputationScore
+  principal
+  {
+    current-score: uint,
+    tier: uint,
+    fee-discount: uint,
+    score-history: (list 10 uint),
+    achievements: (list 5 uint)
+  }
+)
+
+(define-map ContractPerformanceData
+  uint
+  {
+    start-response-time: uint,
+    actual-completion-time: uint,
+    quality-rating: uint,
+    employer-satisfaction: uint,
+    freelancer-satisfaction: uint,
+    performance-recorded: bool
+  }
 )
 
 (define-public (set-mediator (new-mediator principal))
@@ -363,3 +420,208 @@
       }))
   )
 )
+
+;; Performance tracking functions
+(define-public (record-contract-performance (contract-id uint) (quality-rating uint) (employer-satisfaction uint) (freelancer-satisfaction uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (existing-data (map-get? ContractPerformanceData contract-id))
+      (completion-time (- stacks-block-height (get created-at contract)))
+    )
+    (asserts! (or (is-eq tx-sender (get employer contract)) (is-eq tx-sender (get freelancer contract))) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status contract) STATUS-RESOLVED) ERR-WRONG-STATUS)
+    (asserts! (and (>= quality-rating u1) (<= quality-rating u5)) ERR-INVALID-AMOUNT)
+    (asserts! (and (>= employer-satisfaction u1) (<= employer-satisfaction u5)) ERR-INVALID-AMOUNT)
+    (asserts! (and (>= freelancer-satisfaction u1) (<= freelancer-satisfaction u5)) ERR-INVALID-AMOUNT)
+    
+    (if (is-some existing-data)
+      (let
+        (
+          (data (unwrap-panic existing-data))
+        )
+        (asserts! (not (get performance-recorded data)) ERR-ALREADY-EXISTS)
+        (map-set ContractPerformanceData contract-id
+          (merge data {
+            actual-completion-time: completion-time,
+            quality-rating: quality-rating,
+            employer-satisfaction: employer-satisfaction,
+            freelancer-satisfaction: freelancer-satisfaction,
+            performance-recorded: true
+          }))
+        (try! (update-user-performance-metrics (get freelancer contract) contract-id quality-rating completion-time))
+        (try! (update-user-reputation (get freelancer contract)))
+        (ok true))
+      (begin
+        (map-set ContractPerformanceData contract-id {
+          start-response-time: u0,
+          actual-completion-time: completion-time,
+          quality-rating: quality-rating,
+          employer-satisfaction: employer-satisfaction,
+          freelancer-satisfaction: freelancer-satisfaction,
+          performance-recorded: true
+        })
+        (try! (update-user-performance-metrics (get freelancer contract) contract-id quality-rating completion-time))
+        (try! (update-user-reputation (get freelancer contract)))
+        (ok true)))
+  )
+)
+
+(define-public (record-response-time (contract-id uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (response-time (- stacks-block-height (get created-at contract)))
+    )
+    (asserts! (is-eq (get freelancer contract) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status contract) STATUS-IN-PROGRESS) ERR-WRONG-STATUS)
+    
+    (map-set ContractPerformanceData contract-id {
+      start-response-time: response-time,
+      actual-completion-time: u0,
+      quality-rating: u0,
+      employer-satisfaction: u0,
+      freelancer-satisfaction: u0,
+      performance-recorded: false
+    })
+    (ok true)
+  )
+)
+
+(define-private (update-user-performance-metrics (user principal) (contract-id uint) (quality-rating uint) (completion-time uint))
+  (let
+    (
+      (contract (unwrap! (map-get? Contracts contract-id) ERR-NOT-FOUND))
+      (current-metrics (default-to 
+        { total-contracts: u0, completed-contracts: u0, disputed-contracts: u0, 
+          avg-completion-time: u0, total-quality-score: u0, response-time-score: u0, last-updated: u0 }
+        (map-get? UserPerformanceMetrics user)))
+      (new-total-contracts (+ (get total-contracts current-metrics) u1))
+      (new-completed-contracts (+ (get completed-contracts current-metrics) u1))
+      (new-total-quality (+ (get total-quality-score current-metrics) quality-rating))
+      (new-avg-completion (if (> new-completed-contracts u0)
+        (/ (+ (* (get avg-completion-time current-metrics) (get completed-contracts current-metrics)) completion-time) new-completed-contracts)
+        completion-time))
+    )
+    (map-set UserPerformanceMetrics user {
+      total-contracts: new-total-contracts,
+      completed-contracts: new-completed-contracts,
+      disputed-contracts: (get disputed-contracts current-metrics),
+      avg-completion-time: new-avg-completion,
+      total-quality-score: new-total-quality,
+      response-time-score: (get response-time-score current-metrics),
+      last-updated: stacks-block-height
+    })
+    (ok true)
+  )
+)
+
+(define-private (update-user-reputation (user principal))
+  (let
+    (
+      (metrics (unwrap! (map-get? UserPerformanceMetrics user) ERR-PERFORMANCE-NOT-FOUND))
+      (completion-rate (if (> (get total-contracts metrics) u0)
+        (/ (* (get completed-contracts metrics) u100) (get total-contracts metrics))
+        u0))
+      (dispute-rate (if (> (get total-contracts metrics) u0)
+        (/ (* (get disputed-contracts metrics) u100) (get total-contracts metrics))
+        u0))
+      (avg-quality (if (> (get completed-contracts metrics) u0)
+        (/ (get total-quality-score metrics) (get completed-contracts metrics))
+        u0))
+      (quality-score (if (> avg-quality u0) (* avg-quality u20) u0))
+      (completion-score (* completion-rate WEIGHT-COMPLETION-RATE))
+      (dispute-score (* (- u100 dispute-rate) WEIGHT-DISPUTE-RATE))
+      (response-score (* (get response-time-score metrics) WEIGHT-RESPONSE-TIME))
+      (total-score (/ (+ completion-score dispute-score response-score quality-score) u100))
+      (new-tier (calculate-tier total-score))
+      (fee-discount (get-tier-discount new-tier))
+      (current-reputation (map-get? UserReputationScore user))
+    )
+    (if (is-some current-reputation)
+      (let
+        (
+          (reputation (unwrap-panic current-reputation))
+          (score-history (get score-history reputation))
+          (new-history (unwrap-panic (as-max-len? (append score-history total-score) u10)))
+        )
+        (map-set UserReputationScore user
+          (merge reputation {
+            current-score: total-score,
+            tier: new-tier,
+            fee-discount: fee-discount,
+            score-history: new-history
+          }))
+        (ok true))
+      (begin
+        (map-set UserReputationScore user {
+          current-score: total-score,
+          tier: new-tier,
+          fee-discount: fee-discount,
+          score-history: (list total-score),
+          achievements: (list)
+        })
+        (ok true)))
+  )
+)
+
+(define-private (calculate-tier (score uint))
+  (if (>= score u85)
+    TIER-PLATINUM
+    (if (>= score u70)
+      TIER-GOLD
+      (if (>= score u50)
+        TIER-SILVER
+        TIER-BRONZE)))
+)
+
+(define-private (get-tier-discount (tier uint))
+  (if (is-eq tier TIER-PLATINUM)
+    PLATINUM-DISCOUNT
+    (if (is-eq tier TIER-GOLD)
+      GOLD-DISCOUNT
+      (if (is-eq tier TIER-SILVER)
+        SILVER-DISCOUNT
+        BRONZE-DISCOUNT)))
+)
+
+(define-public (get-user-performance (user principal))
+  (ok (map-get? UserPerformanceMetrics user))
+)
+
+(define-public (get-user-reputation (user principal))
+  (ok (map-get? UserReputationScore user))
+)
+
+(define-public (get-contract-performance (contract-id uint))
+  (ok (map-get? ContractPerformanceData contract-id))
+)
+
+(define-read-only (calculate-fee-with-discount (base-fee uint) (user principal))
+  (let
+    (
+      (reputation (map-get? UserReputationScore user))
+    )
+    (if (is-some reputation)
+      (let
+        (
+          (rep (unwrap-panic reputation))
+          (discount (get fee-discount rep))
+          (discount-amount (/ (* base-fee discount) u100))
+        )
+        (ok (- base-fee discount-amount)))
+      (ok base-fee))
+  )
+)
+
+(define-read-only (get-tier-requirements)
+  (ok {
+    bronze: { min-score: u0, discount: BRONZE-DISCOUNT },
+    silver: { min-score: u50, discount: SILVER-DISCOUNT },
+    gold: { min-score: u70, discount: GOLD-DISCOUNT },
+    platinum: { min-score: u85, discount: PLATINUM-DISCOUNT }
+  })
+)
+
+
+
