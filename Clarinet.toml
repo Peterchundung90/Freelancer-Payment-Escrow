@@ -9,6 +9,17 @@ requirements = []
 path = 'contracts/fpe.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.withdrawal-protection]
+path = 'contracts/withdrawal-protection.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.contract-templates]
+path = 'contracts/contract-templates.clar'
+clarity_version = 3
+epoch = 3.1
+
 [repl.analysis]
 passes = ['check_checker']
 
